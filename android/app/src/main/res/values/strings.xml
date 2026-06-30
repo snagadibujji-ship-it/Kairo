@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="kairo_accessibility_description">Kairo Accessibility Service for GHIAS Mobile. Enables automatic node traversal, elements identification, and gesture control.</string>
+</resources>

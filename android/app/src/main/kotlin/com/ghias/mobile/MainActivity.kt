@@ -1,0 +1,1005 @@
+package com.ghias.mobile
+
+import android.app.AlertDialog
+import android.app.AlarmManager
+import android.app.DownloadManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.util.Log
+import android.os.Handler
+import android.os.Looper
+import android.os.Environment
+import android.provider.OpenableColumns
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodChannel
+import android.os.Build
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import android.media.projection.MediaProjectionManager
+import android.graphics.BitmapFactory
+import android.graphics.Rect
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlin.concurrent.thread
+import kotlin.system.exitProcess
+import org.json.JSONObject
+
+class MainActivity : FlutterActivity() {
+    private val importChannelName = "com.ghias.mobile/model_import"
+    private val tunnelChannelName = "com.ghias.mobile/tunnel"
+    private val importRequestCode = 4207
+    private val accessibilityChannelName = "com.ghias.mobile/accessibility"
+    private val captureChannelName = "com.ghias.mobile/screen_capture"
+    private val ocrChannelName = "com.ghias.mobile/ocr"
+    private val capturePermissionRequestCode = 4208
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private var importChannel: MethodChannel? = null
+    private var tunnelChannel: MethodChannel? = null
+    private var accessibilityChannel: MethodChannel? = null
+    private var captureChannel: MethodChannel? = null
+    private var ocrChannel: MethodChannel? = null
+    private var pendingImportResult: MethodChannel.Result? = null
+    private var pendingPermissionResult: MethodChannel.Result? = null
+    private var pendingModelsDir: String? = null
+    private var tunnelProcess: Process? = null
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        importChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, importChannelName)
+        importChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "pickAndImportModel" -> {
+                    if (pendingImportResult != null) {
+                        result.error("IMPORT_BUSY", "Another model import is already running.", null)
+                        return@setMethodCallHandler
+                    }
+                    val modelsDir = call.argument<String>("modelsDir")
+                    if (modelsDir.isNullOrBlank()) {
+                        result.error("INVALID_DIR", "Models directory is missing.", null)
+                        return@setMethodCallHandler
+                    }
+                    pendingModelsDir = modelsDir
+                    pendingImportResult = result
+                    openModelPicker()
+                }
+                "downloadToDownloads" -> {
+                    val url = call.argument<String>("url")
+                    val filename = call.argument<String>("filename")
+                    if (url.isNullOrBlank() || filename.isNullOrBlank()) {
+                        result.error("INVALID_DOWNLOAD", "Model URL or filename is missing.", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val downloadId = enqueueDownloadToDownloads(url, filename)
+                        result.success(mapOf("downloadId" to downloadId, "filename" to sanitizeFilename(filename)))
+                    } catch (e: Exception) {
+                        result.error("DOWNLOAD_FAILED", e.message ?: e.toString(), null)
+                    }
+                }
+                "cancelDownloadToDownloads" -> {
+                    val downloadId = (call.argument<Any>("downloadId") as? Number)?.toLong()
+                    if (downloadId != null) {
+                        try {
+                            val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                            manager.remove(downloadId)
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("CANCEL_FAILED", e.message ?: e.toString(), null)
+                        }
+                    } else {
+                        result.error("INVALID_DOWNLOAD_ID", "Download ID is missing.", null)
+                    }
+                }
+                "downloadModelInApp" -> {
+                    val url = call.argument<String>("url")
+                    val filename = call.argument<String>("filename")
+                    val modelsDir = call.argument<String>("modelsDir")
+                    if (url.isNullOrBlank() || filename.isNullOrBlank() || modelsDir.isNullOrBlank()) {
+                        result.error("INVALID_DOWNLOAD", "URL, filename, or modelsDir is missing.", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val downloadId = enqueueDownloadInApp(url, filename, modelsDir)
+                        result.success(mapOf("downloadId" to downloadId, "filename" to sanitizeFilename(filename)))
+                    } catch (e: Exception) {
+                        result.error("DOWNLOAD_FAILED", e.message ?: e.toString(), null)
+                    }
+                }
+                "cancelDownloadInApp" -> {
+                    val downloadId = (call.argument<Any>("downloadId") as? Number)?.toLong()
+                    if (downloadId != null) {
+                        try {
+                            val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                            manager.remove(downloadId)
+                            val filename = call.argument<String>("filename")
+                            if (!filename.isNullOrBlank()) {
+                                val destFile = File(File(getExternalFilesDir(null), "temp_downloads"), sanitizeFilename(filename))
+                                if (destFile.exists()) destFile.delete()
+                            }
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("CANCEL_FAILED", e.message ?: e.toString(), null)
+                        }
+                    } else {
+                        result.error("INVALID_DOWNLOAD_ID", "Download ID is missing.", null)
+                    }
+                }
+                "getActiveDownloads" -> {
+                    try {
+                        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                        val query = DownloadManager.Query().setFilterByStatus(
+                            DownloadManager.STATUS_RUNNING or 
+                            DownloadManager.STATUS_PAUSED or 
+                            DownloadManager.STATUS_PENDING
+                        )
+                        val activeList = mutableListOf<Map<String, Any>>()
+                        manager.query(query)?.use { cursor ->
+                            val idIndex = cursor.getColumnIndex(DownloadManager.COLUMN_ID)
+                            val titleIndex = cursor.getColumnIndex(DownloadManager.COLUMN_TITLE)
+                            val statusIndex = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                            val bytesDownloadedIndex = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+                            val bytesTotalIndex = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+
+                            if (idIndex >= 0 && titleIndex >= 0 && statusIndex >= 0 && bytesDownloadedIndex >= 0 && bytesTotalIndex >= 0) {
+                                while (cursor.moveToNext()) {
+                                    val id = cursor.getLong(idIndex)
+                                    val title = cursor.getString(titleIndex)
+                                    val status = cursor.getInt(statusIndex)
+                                    val downloaded = cursor.getLong(bytesDownloadedIndex)
+                                    val total = cursor.getLong(bytesTotalIndex)
+                                    val statusStr = when (status) {
+                                        DownloadManager.STATUS_RUNNING -> "Downloading..."
+                                        DownloadManager.STATUS_PAUSED -> "Paused"
+                                        DownloadManager.STATUS_PENDING -> "Pending"
+                                        else -> "Unknown"
+                                    }
+                                    activeList.add(mapOf(
+                                        "downloadId" to id,
+                                        "filename" to title,
+                                        "downloaded" to downloaded,
+                                        "total" to total,
+                                        "status" to statusStr
+                                    ))
+                                }
+                            }
+                        }
+                        result.success(activeList)
+                    } catch (e: java.lang.Exception) {
+                        result.error("QUERY_FAILED", e.message ?: e.toString(), null)
+                    }
+                }
+                "restartApp" -> {
+                    restartApp()
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        tunnelChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, tunnelChannelName)
+        tunnelChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "startTunnel" -> {
+                    val provider = call.argument<String>("provider") ?: "cloudflare"
+                    val port = call.argument<Int>("port") ?: 8080
+                    val cloudflareToken = call.argument<String>("cloudflareToken") ?: ""
+                    val cloudflarePublicUrl = call.argument<String>("cloudflarePublicUrl") ?: ""
+                    val ngrokAuthToken = call.argument<String>("ngrokAuthToken") ?: ""
+                    val ngrokDomain = call.argument<String>("ngrokDomain") ?: ""
+                    startTunnelAsync(
+                        provider = provider,
+                        port = port,
+                        cloudflareToken = cloudflareToken,
+                        cloudflarePublicUrl = cloudflarePublicUrl,
+                        ngrokAuthToken = ngrokAuthToken,
+                        ngrokDomain = ngrokDomain,
+                        result = result
+                    )
+                }
+                "stopTunnel" -> {
+                    stopTunnel()
+                    result.success(null)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        accessibilityChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, accessibilityChannelName)
+        
+        KairoAccessibilityService.eventListener = object : KairoAccessibilityService.AccessibilityEventListener {
+            override fun onEventLogged(type: String, text: String, packageName: String) {
+                mainHandler.post {
+                    accessibilityChannel?.invokeMethod("onUserAction", mapOf(
+                        "type" to type,
+                        "text" to text,
+                        "packageName" to packageName
+                    ))
+                }
+            }
+        }
+
+        accessibilityChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "isServiceEnabled" -> {
+                    result.success(KairoAccessibilityService.instance != null)
+                }
+                "click" -> {
+                    val x = call.argument<Double>("x")?.toFloat()
+                    val y = call.argument<Double>("y")?.toFloat()
+                    if (x == null || y == null) {
+                        result.error("INVALID_ARGS", "x and y coordinates are required", null)
+                        return@setMethodCallHandler
+                    }
+                    val service = KairoAccessibilityService.instance
+                    if (service == null) {
+                        result.error("SERVICE_DISABLED", "Kairo Accessibility Service is not running", null)
+                        return@setMethodCallHandler
+                    }
+                    val success = service.performClick(x, y)
+                    result.success(success)
+                }
+                "swipe" -> {
+                    val startX = call.argument<Double>("startX")?.toFloat()
+                    val startY = call.argument<Double>("startY")?.toFloat()
+                    val endX = call.argument<Double>("endX")?.toFloat()
+                    val endY = call.argument<Double>("endY")?.toFloat()
+                    val duration = call.argument<Int>("duration")?.toLong() ?: 300L
+                    if (startX == null || startY == null || endX == null || endY == null) {
+                        result.error("INVALID_ARGS", "Coordinates startX, startY, endX, endY are required", null)
+                        return@setMethodCallHandler
+                    }
+                    val service = KairoAccessibilityService.instance
+                    if (service == null) {
+                        result.error("SERVICE_DISABLED", "Kairo Accessibility Service is not running", null)
+                        return@setMethodCallHandler
+                    }
+                    val success = service.performSwipe(startX, startY, endX, endY, duration)
+                    result.success(success)
+                }
+                "getScreenHierarchy" -> {
+                    val service = KairoAccessibilityService.instance
+                    if (service == null) {
+                        result.error("SERVICE_DISABLED", "Kairo Accessibility Service is not running", null)
+                        return@setMethodCallHandler
+                    }
+                    val hierarchy = service.getScreenHierarchy()
+                    result.success(hierarchy)
+                }
+                "launchApp" -> {
+                    val packageName = call.argument<String>("packageName")
+                    if (packageName.isNullOrBlank()) {
+                        result.error("INVALID_ARGS", "packageName is required", null)
+                        return@setMethodCallHandler
+                    }
+                    val service = KairoAccessibilityService.instance
+                    if (service == null) {
+                        result.error("SERVICE_DISABLED", "Kairo Accessibility Service is not running", null)
+                        return@setMethodCallHandler
+                    }
+                    val success = service.launchApp(packageName)
+                    result.success(success)
+                }
+                else -> {
+                    result.notImplemented()
+                }
+            }
+        }
+
+        captureChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, captureChannelName)
+        captureChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "requestCapturePermission" -> {
+                    if (pendingPermissionResult != null) {
+                        result.error("PERMISSION_BUSY", "Another screen capture permission request is running.", null)
+                        return@setMethodCallHandler
+                    }
+                    pendingPermissionResult = result
+                    val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                    val permissionIntent = mpManager.createScreenCaptureIntent()
+                    startActivityForResult(permissionIntent, capturePermissionRequestCode)
+                }
+                "captureScreenshot" -> {
+                    val service = ForegroundCaptureService.instance
+                    if (service == null) {
+                        result.error("SERVICE_DISABLED", "Foreground capture service is not running.", null)
+                        return@setMethodCallHandler
+                    }
+                    val frameBytes = service.captureLatestFrame()
+                    if (frameBytes != null) {
+                        result.success(frameBytes)
+                    } else {
+                        result.error("CAPTURE_FAILED", "Failed to capture latest frame.", null)
+                    }
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        ocrChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, ocrChannelName)
+        ocrChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "detectText" -> {
+                    val imageBytes = call.argument<ByteArray>("imageBytes")
+                    if (imageBytes == null) {
+                        result.error("INVALID_ARGS", "imageBytes is required", null)
+                        return@setMethodCallHandler
+                    }
+                    
+                    val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+                    if (bitmap == null) {
+                        result.error("DECODE_FAILED", "Failed to decode image bytes to bitmap.", null)
+                        return@setMethodCallHandler
+                    }
+
+                    val image = InputImage.fromBitmap(bitmap, 0)
+                    val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+                    
+                    recognizer.process(image)
+                        .addOnSuccessListener { visionText ->
+                            val detectedList = mutableListOf<Map<String, Any>>()
+                            for (block in visionText.textBlocks) {
+                                for (line in block.lines) {
+                                    val rect = line.boundingBox
+                                    val boundsMap = mapOf(
+                                        "left" to (rect?.left?.toDouble() ?: 0.0),
+                                        "top" to (rect?.top?.toDouble() ?: 0.0),
+                                        "right" to (rect?.right?.toDouble() ?: 0.0),
+                                        "bottom" to (rect?.bottom?.toDouble() ?: 0.0)
+                                    )
+                                    detectedList.add(mapOf(
+                                        "text" to line.text,
+                                        "confidence" to (line.confidence?.toDouble() ?: 1.0),
+                                        "bounds" to boundsMap
+                                    ))
+                                }
+                            }
+                            result.success(detectedList)
+                            bitmap.recycle()
+                        }
+                        .addOnFailureListener { e ->
+                            result.error("OCR_FAILED", e.message ?: e.toString(), null)
+                            bitmap.recycle()
+                        }
+                }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    private fun startTunnelAsync(
+        provider: String,
+        port: Int,
+        cloudflareToken: String,
+        cloudflarePublicUrl: String,
+        ngrokAuthToken: String,
+        ngrokDomain: String,
+        result: MethodChannel.Result,
+    ) {
+        thread(name = "ai-chat-tunnel-start") {
+            try {
+                stopTunnel()
+                val tunnelResult = if (provider == "ngrok") {
+                    startNgrokTunnel(port, ngrokAuthToken, ngrokDomain)
+                } else {
+                    startCloudflareTunnel(port, cloudflareToken, cloudflarePublicUrl)
+                }
+                mainHandler.post {
+                    result.success(
+                        mapOf(
+                            "success" to tunnelResult.success,
+                            "publicUrl" to tunnelResult.publicUrl,
+                            "error" to tunnelResult.error
+                        )
+                    )
+                }
+            } catch (e: Exception) {
+                mainHandler.post {
+                    result.success(
+                        mapOf(
+                            "success" to false,
+                            "publicUrl" to null,
+                            "error" to (e.message ?: e.toString())
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    private fun startCloudflareTunnel(
+        port: Int,
+        token: String,
+        configuredUrl: String,
+    ): TunnelResult {
+        val binary = resolveNativeBinary("libcloudflared.so")
+            ?: return TunnelResult(false, null, "cloudflared binary is missing for this ABI.")
+        val args = mutableListOf(
+            binary.absolutePath,
+            "tunnel",
+            "--no-autoupdate",
+            "--protocol",
+            "http2",
+        )
+        val normalizedConfiguredUrl = normalizeHttpsUrl(configuredUrl)
+        if (token.isNotBlank()) {
+            args += listOf("run", "--token", token.trim())
+        } else {
+            args += listOf("--url", "http://localhost:$port")
+        }
+        val process = startTunnelProcess(args)
+        tunnelProcess = process
+
+        val deadline = System.currentTimeMillis() + 45000L
+        var publicUrl = normalizedConfiguredUrl
+        val reader = process.inputStream.bufferedReader()
+        while (System.currentTimeMillis() < deadline) {
+            if (processHasExited(process)) {
+                return TunnelResult(false, null, "cloudflared exited before the tunnel was ready.")
+            }
+            val line = readLineWithTimeout(reader) ?: continue
+            Log.d("AIChatTunnel", "cloudflared: $line")
+            publicUrl = publicUrl ?: Regex("""https://[A-Za-z0-9.-]+\.trycloudflare\.com""")
+                .find(line)
+                ?.value
+            if (line.contains("Registered tunnel connection") && publicUrl != null) {
+                startLogReader(reader, "cloudflared")
+                return TunnelResult(true, publicUrl, null)
+            }
+        }
+        return TunnelResult(false, null, "Cloudflare tunnel did not become ready in time.")
+    }
+
+    private fun startNgrokTunnel(
+        port: Int,
+        authToken: String,
+        domain: String,
+    ): TunnelResult {
+        if (authToken.isBlank()) {
+            return TunnelResult(false, null, "ngrok auth token is required.")
+        }
+        val binary = resolveNativeBinary("libngrok.so")
+            ?: return TunnelResult(false, null, "ngrok binary is missing for this ABI.")
+        val configFile = writeNgrokConfig(authToken)
+        val args = mutableListOf(
+            binary.absolutePath,
+            "http",
+            port.toString(),
+            "--config",
+            configFile.absolutePath,
+            "--log",
+            "stdout",
+            "--log-format",
+            "json",
+        )
+        val requestedUrl = normalizeHttpsUrl(domain)
+        if (requestedUrl != null) {
+            args += listOf("--url", requestedUrl)
+        }
+        val process = startTunnelProcess(args)
+        tunnelProcess = process
+        startLogReader(process.inputStream.bufferedReader(), "ngrok")
+        val deadline = System.currentTimeMillis() + 30000L
+        while (System.currentTimeMillis() < deadline) {
+            if (processHasExited(process)) {
+                return TunnelResult(false, null, "ngrok exited before the tunnel was ready.")
+            }
+            queryNgrokPublicUrl()?.let { url ->
+                if (requestedUrl == null || requestedUrl == url) {
+                    return TunnelResult(true, url, null)
+                }
+            }
+            Thread.sleep(500L)
+        }
+        return TunnelResult(false, null, "ngrok tunnel did not become ready in time.")
+    }
+
+    private fun startTunnelProcess(args: List<String>): Process {
+        return ProcessBuilder(args).apply {
+            directory(filesDir)
+            environment()["HOME"] = filesDir.parentFile?.absolutePath ?: filesDir.absolutePath
+            redirectErrorStream(true)
+        }.start()
+    }
+
+    private fun resolveNativeBinary(name: String): File? {
+        val nativeDir = applicationInfo.nativeLibraryDir ?: return null
+        return File(nativeDir, name).takeIf { it.exists() }
+    }
+
+    private fun stopTunnel() {
+        try {
+            tunnelProcess?.destroy()
+        } catch (_: Exception) {}
+        tunnelProcess = null
+    }
+
+    private fun processHasExited(process: Process): Boolean {
+        return try {
+            process.exitValue()
+            true
+        } catch (_: IllegalThreadStateException) {
+            false
+        }
+    }
+
+    private fun readLineWithTimeout(reader: java.io.BufferedReader): String? {
+        val started = System.currentTimeMillis()
+        while (System.currentTimeMillis() - started < 500L) {
+            if (reader.ready()) return reader.readLine()
+            Thread.sleep(50L)
+        }
+        return null
+    }
+
+    private fun startLogReader(reader: java.io.BufferedReader, label: String) {
+        thread(name = "ai-chat-$label-log", isDaemon = true) {
+            try {
+                var line: String?
+                while (reader.readLine().also { line = it } != null) {
+                    Log.d("AIChatTunnel", "$label: ${line.orEmpty()}")
+                }
+            } catch (_: Exception) {}
+        }
+    }
+
+    private fun writeNgrokConfig(authToken: String): File {
+        val dir = File(filesDir, "ngrok")
+        if (!dir.exists()) dir.mkdirs()
+        val file = File(dir, "ngrok.yml")
+        file.writeText(
+            """
+            version: 3
+            agent:
+              authtoken: ${authToken.trim()}
+              dns_resolver_ips:
+                - 1.1.1.1
+                - 8.8.8.8
+              update_check: false
+              crl_noverify: true
+            """.trimIndent()
+        )
+        return file
+    }
+
+    private fun queryNgrokPublicUrl(): String? {
+        val connection = (URL("http://127.0.0.1:4040/api/tunnels").openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 4000
+            readTimeout = 4000
+            doInput = true
+            setRequestProperty("Accept", "application/json")
+        }
+        return try {
+            if (connection.responseCode !in 200..299) return null
+            val body = connection.inputStream.bufferedReader().use { it.readText() }
+            val tunnels = JSONObject(body).optJSONArray("tunnels") ?: return null
+            for (i in 0 until tunnels.length()) {
+                val url = tunnels.optJSONObject(i)?.optString("public_url").orEmpty()
+                if (url.startsWith("https://")) return url.trimEnd('/')
+            }
+            null
+        } catch (_: Exception) {
+            null
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun normalizeHttpsUrl(value: String): String? {
+        val trimmed = value.trim().trimEnd('/').trimStart('.')
+        if (trimmed.isBlank()) return null
+        return if (trimmed.startsWith("https://") || trimmed.startsWith("http://")) trimmed else "https://$trimmed"
+    }
+
+    private data class TunnelResult(
+        val success: Boolean,
+        val publicUrl: String?,
+        val error: String?,
+    )
+
+    private fun restartApp() {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        if (launchIntent == null) {
+            finishAffinity()
+            return
+        }
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK)
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            9208,
+            launchIntent,
+            PendingIntent.FLAG_CANCEL_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        alarmManager.set(
+            AlarmManager.RTC,
+            System.currentTimeMillis() + 350L,
+            pendingIntent
+        )
+        finishAffinity()
+        exitProcess(0)
+    }
+
+    private fun enqueueDownloadToDownloads(url: String, filename: String): Long {
+        val safeName = sanitizeFilename(filename)
+        val request = DownloadManager.Request(Uri.parse(url)).apply {
+            setTitle(safeName)
+            setDescription("Downloading AI model")
+            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            setAllowedOverMetered(true)
+            setAllowedOverRoaming(true)
+            setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, safeName)
+            addRequestHeader("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+            addRequestHeader("Accept", "*/*")
+        }
+        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val downloadId = manager.enqueue(request)
+
+        thread(name = "download-monitor-$downloadId") {
+            var isFinished = false
+            var lastBytes = 0L
+            var lastTime = System.currentTimeMillis()
+            var lastReportedSpeed = 0.0
+
+            while (!isFinished) {
+                Thread.sleep(1000)
+                val query = DownloadManager.Query().setFilterById(downloadId)
+                manager.query(query)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val statusIndex = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                        val bytesDownloadedIndex = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+                        val bytesTotalIndex = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+
+                        if (statusIndex >= 0 && bytesDownloadedIndex >= 0 && bytesTotalIndex >= 0) {
+                            val status = cursor.getInt(statusIndex)
+                            val downloaded = cursor.getLong(bytesDownloadedIndex)
+                            val total = cursor.getLong(bytesTotalIndex)
+
+                            val now = System.currentTimeMillis()
+                            val elapsedSeconds = (now - lastTime) / 1000.0
+                            var bytesPerSecond = 0.0
+
+                            if (downloaded > lastBytes) {
+                                bytesPerSecond = if (elapsedSeconds > 0) ((downloaded - lastBytes) / elapsedSeconds) else 0.0
+                                lastBytes = downloaded
+                                lastTime = now
+                                lastReportedSpeed = bytesPerSecond
+                            } else {
+                                if (elapsedSeconds > 3.0) {
+                                    lastReportedSpeed = 0.0
+                                }
+                                bytesPerSecond = lastReportedSpeed
+                            }
+
+                            if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                                isFinished = true
+                                emitProgress(safeName, total, total, 0.0, "Download complete")
+                            } else if (status == DownloadManager.STATUS_FAILED) {
+                                isFinished = true
+                                emitProgress(safeName, downloaded, total, 0.0, "Download failed")
+                            } else {
+                                emitProgress(safeName, downloaded, total, bytesPerSecond, "Downloading to phone...")
+                            }
+                        }
+                    } else {
+                        isFinished = true
+                        emitProgress(safeName, 0, 0, 0.0, "Download cancelled")
+                    }
+                } ?: run {
+                    isFinished = true
+                }
+            }
+        }
+        return downloadId
+    }
+
+    private fun enqueueDownloadInApp(url: String, filename: String, modelsDir: String): Long {
+        val safeName = sanitizeFilename(filename)
+        val tempDownloadsDir = File(getExternalFilesDir(null), "temp_downloads")
+        tempDownloadsDir.mkdirs()
+        val destFile = File(tempDownloadsDir, safeName)
+        if (destFile.exists()) destFile.delete()
+
+        val request = DownloadManager.Request(Uri.parse(url)).apply {
+            setTitle(safeName)
+            setDescription("Downloading local AI model")
+            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE)
+            setAllowedOverMetered(true)
+            setAllowedOverRoaming(true)
+            setDestinationUri(Uri.fromFile(destFile))
+            addRequestHeader("User-Agent", "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36")
+            addRequestHeader("Accept", "*/*")
+        }
+        val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val downloadId = manager.enqueue(request)
+
+        thread(name = "download-inapp-monitor-$downloadId") {
+            var isFinished = false
+            var lastBytes = 0L
+            var lastTime = System.currentTimeMillis()
+            var lastReportedSpeed = 0.0
+
+            while (!isFinished) {
+                Thread.sleep(1000)
+                val query = DownloadManager.Query().setFilterById(downloadId)
+                manager.query(query)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val statusIndex = cursor.getColumnIndex(DownloadManager.COLUMN_STATUS)
+                        val bytesDownloadedIndex = cursor.getColumnIndex(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+                        val bytesTotalIndex = cursor.getColumnIndex(DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+
+                        if (statusIndex >= 0 && bytesDownloadedIndex >= 0 && bytesTotalIndex >= 0) {
+                            val status = cursor.getInt(statusIndex)
+                            val downloaded = cursor.getLong(bytesDownloadedIndex)
+                            val total = cursor.getLong(bytesTotalIndex)
+
+                            val now = System.currentTimeMillis()
+                            val elapsedSeconds = (now - lastTime) / 1000.0
+                            var bytesPerSecond = 0.0
+
+                            if (downloaded > lastBytes) {
+                                bytesPerSecond = if (elapsedSeconds > 0) ((downloaded - lastBytes) / elapsedSeconds) else 0.0
+                                lastBytes = downloaded
+                                lastTime = now
+                                lastReportedSpeed = bytesPerSecond
+                            } else {
+                                if (elapsedSeconds > 3.0) {
+                                    lastReportedSpeed = 0.0
+                                }
+                                bytesPerSecond = lastReportedSpeed
+                            }
+
+                            if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                                isFinished = true
+                                try {
+                                    Log.d("MainActivity", "Download successful for $safeName. Temp file size: ${destFile.length()} bytes, expected: $total bytes")
+                                    emitProgress(safeName, downloaded, total, 0.0, "Importing to app storage...")
+                                    val targetFile = File(modelsDir, safeName)
+                                    val partFile = File(targetFile.parentFile, "${targetFile.name}.part")
+                                    if (partFile.exists()) partFile.delete()
+                                    if (destFile.exists()) {
+                                        destFile.copyTo(partFile, overwrite = true)
+                                        if (targetFile.exists()) targetFile.delete()
+                                        partFile.renameTo(targetFile)
+                                        destFile.delete()
+                                        Log.d("MainActivity", "Model copy successful for $safeName. Final size: ${targetFile.length()} bytes")
+                                    }
+                                    emitProgress(safeName, total, total, 0.0, "Download complete")
+                                } catch (e: Exception) {
+                                    Log.e("MainActivity", "Failed to copy downloaded model: ${e.message}", e)
+                                    emitProgress(safeName, downloaded, total, 0.0, "Download failed: import error")
+                                }
+                            } else if (status == DownloadManager.STATUS_FAILED) {
+                                isFinished = true
+                                emitProgress(safeName, downloaded, total, 0.0, "Download failed")
+                            } else {
+                                emitProgress(safeName, downloaded, total, bytesPerSecond, "Downloading...")
+                            }
+                        }
+                    } else {
+                        isFinished = true
+                        emitProgress(safeName, 0, 0, 0.0, "Download cancelled")
+                    }
+                } ?: run {
+                    isFinished = true
+                }
+            }
+        }
+        return downloadId
+    }
+
+    private fun openModelPicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        }
+        startActivityForResult(intent, importRequestCode)
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == capturePermissionRequestCode) {
+            val result = pendingPermissionResult
+            pendingPermissionResult = null
+            if (resultCode == RESULT_OK && data != null) {
+                val serviceIntent = Intent(this, ForegroundCaptureService::class.java).apply {
+                    putExtra("resultCode", resultCode)
+                    putExtra("resultData", data)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    startForegroundService(serviceIntent)
+                } else {
+                    startService(serviceIntent)
+                }
+                result?.success(true)
+            } else {
+                result?.success(false)
+            }
+            return
+        }
+
+        if (requestCode != importRequestCode) return
+
+        if (resultCode != RESULT_OK || data?.data == null) {
+            finishImportSuccess(mapOf("cancelled" to true))
+            return
+        }
+
+        val uri = data.data!!
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        } catch (_: Exception) {
+            // Some providers do not allow persistable grants; the one-shot grant is enough here.
+        }
+
+        val filename = displayNameFor(uri)
+        val lower = filename.lowercase()
+        if (!lower.endsWith(".gguf") && !lower.endsWith(".litertlm") && !lower.endsWith(".safetensors")) {
+            finishImportError(
+                "UNSUPPORTED_MODEL",
+                "Only .gguf, .litertlm, and .safetensors files can be imported."
+            )
+            return
+        }
+
+        val size = sizeFor(uri)
+        if (size <= 0L) {
+            finishImportError("EMPTY_MODEL", "The selected file is empty or unreadable.")
+            return
+        }
+
+        val modelsDir = pendingModelsDir
+        if (modelsDir.isNullOrBlank()) {
+            finishImportError("INVALID_DIR", "Models directory is missing.")
+            return
+        }
+
+        val destination = File(modelsDir, sanitizeFilename(filename))
+        if (destination.exists()) {
+            AlertDialog.Builder(this)
+                .setTitle("Model already imported")
+                .setMessage("${destination.name} already exists in app storage. Replace it?")
+                .setNegativeButton("Cancel") { _, _ ->
+                    finishImportSuccess(mapOf("cancelled" to true))
+                }
+                .setPositiveButton("Replace") { _, _ ->
+                    copyUriToModel(uri, destination, size, true)
+                }
+                .show()
+        } else {
+            copyUriToModel(uri, destination, size, false)
+        }
+    }
+
+    private fun copyUriToModel(uri: Uri, destination: File, totalBytes: Long, replacing: Boolean) {
+        emitProgress(destination.name, 0L, totalBytes, 0.0, "Copying to app storage...")
+        thread(name = "model-import-${destination.name}") {
+            val partFile = File(destination.parentFile, "${destination.name}.part")
+            val startedAt = System.currentTimeMillis()
+            var copied = 0L
+            try {
+                destination.parentFile?.mkdirs()
+                if (partFile.exists()) partFile.delete()
+
+                contentResolver.openInputStream(uri).use { input ->
+                    if (input == null) {
+                        throw IllegalStateException("Unable to open selected file.")
+                    }
+                    partFile.outputStream().use { output ->
+                        val buffer = ByteArray(1024 * 1024)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            output.write(buffer, 0, read)
+                            copied += read
+                            val elapsedSeconds =
+                                (System.currentTimeMillis() - startedAt).coerceAtLeast(1) / 1000.0
+                            emitProgress(
+                                destination.name,
+                                copied,
+                                totalBytes,
+                                copied / elapsedSeconds,
+                                "Copying to app storage..."
+                            )
+                        }
+                    }
+                }
+
+                if (replacing && destination.exists()) destination.delete()
+                if (!partFile.renameTo(destination)) {
+                    throw IllegalStateException("Unable to finalize imported model.")
+                }
+                emitProgress(destination.name, totalBytes, totalBytes, 0.0, "Import complete")
+                finishImportSuccess(
+                    mapOf(
+                        "cancelled" to false,
+                        "filename" to destination.name,
+                        "bytes" to totalBytes,
+                        "replaced" to replacing
+                    )
+                )
+            } catch (e: Exception) {
+                if (partFile.exists()) partFile.delete()
+                finishImportError("IMPORT_FAILED", e.message ?: e.toString())
+            }
+        }
+    }
+
+    private fun emitProgress(
+        filename: String,
+        copiedBytes: Long,
+        totalBytes: Long,
+        bytesPerSecond: Double,
+        status: String,
+    ) {
+        mainHandler.post {
+            importChannel?.invokeMethod(
+                "importProgress",
+                mapOf(
+                    "filename" to filename,
+                    "copiedBytes" to copiedBytes,
+                    "totalBytes" to totalBytes,
+                    "bytesPerSecond" to bytesPerSecond,
+                    "status" to status
+                )
+            )
+        }
+    }
+
+    private fun finishImportSuccess(payload: Map<String, Any?>) {
+        mainHandler.post {
+            pendingImportResult?.success(payload)
+            pendingImportResult = null
+            pendingModelsDir = null
+        }
+    }
+
+    private fun finishImportError(code: String, message: String) {
+        mainHandler.post {
+            pendingImportResult?.error(code, message, null)
+            pendingImportResult = null
+            pendingModelsDir = null
+        }
+    }
+
+    private fun displayNameFor(uri: Uri): String {
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (index >= 0) {
+                        val value = cursor.getString(index)
+                        if (!value.isNullOrBlank()) return value
+                    }
+                }
+            }
+        return uri.lastPathSegment?.substringAfterLast('/') ?: "model.gguf"
+    }
+
+    private fun sizeFor(uri: Uri): Long {
+        contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+            ?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val index = cursor.getColumnIndex(OpenableColumns.SIZE)
+                    if (index >= 0) return cursor.getLong(index)
+                }
+            }
+        return -1L
+    }
+
+    private fun sanitizeFilename(filename: String): String {
+        return filename.replace(Regex("""[\\/:*?"<>|]"""), "_")
+    }
+}
