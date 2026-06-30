@@ -36,11 +36,14 @@ graph TD
     Exec --> Timeline[ScreenshotTimeline]
     Exec --> ResilientClick[SelfHealingExecutor]
     
-    ResilientClick --> A[Strategy A: Accessibility Node]
-    ResilientClick --> B[Strategy B: OCR Bounds]
-    ResilientClick --> C[Strategy C: Sibling Clickable]
+    ResilientClick --> StrategyA[Strategy A: Accessibility Node]
+    ResilientClick --> StrategyB[Strategy B: OCR Bounds]
+    ResilientClick --> StrategyC[Strategy C: Sibling Clickable]
     
-    A & B & C --> Gestures[KairoAccessibility API]
+    StrategyA --> Gestures[KairoAccessibility API]
+    StrategyB --> Gestures
+    StrategyC --> Gestures
+    
     Gestures --> Settle[Settle Frame Delay]
     Settle --> Eyes[ScreenUnderstandingService]
     
@@ -53,8 +56,8 @@ graph TD
     Verifier --> Classify[FailureClassifier]
     Verifier --> Retry[RetryManager]
     
-    Retry --> |Failure / Backoff| Exec
-    Verifier --> |Success| Success[SuccessDetector]
+    Retry -- "Failure / Backoff" --> Exec
+    Verifier -- "Success" --> Success[SuccessDetector]
 ```
 
 ---
